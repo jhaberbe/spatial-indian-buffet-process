@@ -1,1 +1,4 @@
 notebook/wandb/
+data/
+.venv/
+src/__pycache__

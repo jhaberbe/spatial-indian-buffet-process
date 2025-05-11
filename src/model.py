@@ -1,3 +1,4 @@
+import wandb
 import torch
 import torch.nn as nn
 from torch.distributions import constraints
@@ -11,9 +12,15 @@ from pyro.infer import SVI, Trace_ELBO, JitTrace_ELBO
 from pyro.contrib.gp.kernels import Matern52
 from pyro.contrib.gp.util import conditional
 
-class SpatialIndianBuffetProcess(PyroModule):
+from IPython.display import clear_output
+import pandas as pd
 
-    def __init__(self, n_latent_factors: int = 20, device: str = None, low_rank_approximation_dimension: int = 20, length_scale: int = 100):
+class SpatialIndianBuffetProcess():
+
+    def __init__(self, adata, n_latent_factors: int = 20, device: str = None, low_rank_approximation_dimension: int = 20, length_scale: int = 100):
+
+        self.feature_names = adata.var_names
+
         # identify device
         if device == None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,7 +28,7 @@ class SpatialIndianBuffetProcess(PyroModule):
             self.device = device
 
         # Setup as a tensor, makes life easier, we coerce to a float for ease.
-        self.n_latent_factors = torch.tensor(n_latent_factors).float().to(device)
+        self.n_latent_factors = torch.tensor(n_latent_factors).float().to(self.device)
 
         # Low rank dimension of MVN approximmation sampling.
         self.low_rank_approximation_dimension = low_rank_approximation_dimension
@@ -35,26 +42,24 @@ class SpatialIndianBuffetProcess(PyroModule):
         K = int(self.n_latent_factors.item())
         G = int(torch.max(group_assignments).item() + 1)
 
-        size_factor = torch.log(count_matrix.sum(axis=1) / count_matrix.sum(axis=1).mean())
+        size_factor = torch.log(count_matrix.float().sum(axis=1) / count_matrix.float().sum(axis=1).mean())
 
-        torch.tensor(np.log((count_matrix.sum(axis=1) / adata.X.sum(axis=1).mean())))
-        
         # scaling mu is the strongest impact. 0 cuts a good balance, higher causes K to scale rapidly
-        mu = pyro.param("mu", torch.tensor(0.0, device=self.device, dtype=dtype))
-        tau = pyro.param("tau", torch.tensor(1.0, device=self.device, dtype=dtype), constraint=constraints.positive)
-        phi = pyro.param("phi", torch.tensor(self.length_scale, device=self.device, dtype=dtype), constraint=constraints.positive)
+        mu = pyro.param("mu", torch.tensor(0.0, device=self.device, dtype=torch.float32))
+        tau = pyro.param("tau", torch.tensor(1.0, device=self.device, dtype=torch.float32), constraint=constraints.positive)
+        phi = pyro.param("phi", torch.tensor(self.length_scale, device=self.device, dtype=torch.float32), constraint=constraints.positive)
 
         # Setting up GP (MVN draw).
         kernel = Matern52(input_dim=2, lengthscale=phi)
         cov_matrix = kernel(coordinates)
         scaled_cov_matrix = (1.0 / tau) * cov_matrix
-        mean_vec = mu * torch.ones(N, device=self.device, dtype=dtype)
+        mean_vec = mu * torch.ones(N, device=self.device, dtype=torch.float32)
 
         # K latent factor GP Sampling.
         with pyro.plate("latent_features", K):
             # Low Rank Adaptation to avoid destroying my device.
-            cov_factor = pyro.param("cov_factor", torch.randn(K, N, self.low_rank_approximation, device=self.device)).to(self.device)
-            cov_diag = pyro.param("cov_diag", torch.ones(K, N, device=self.device) * 1e-2, constraint=dist.constraints.positive).to(device)
+            cov_factor = pyro.param("cov_factor", torch.randn(K, N, self.low_rank_approximation_dimension, device=self.device)).to(self.device)
+            cov_diag = pyro.param("cov_diag", torch.ones(K, N, device=self.device) * 1e-2, constraint=dist.constraints.positive).to(self.device)
 
             u_k = pyro.sample(
                 "u_k",
@@ -73,27 +78,25 @@ class SpatialIndianBuffetProcess(PyroModule):
         pi_expand = pi_k.transpose(0, 1)
         
 
-        # FIXME:
-        # I don't think this is needed, but keeping around until I'm sure
-        # with pyro.plate("observations", N):
-        #     z = pyro.sample("z", dist.Bernoulli(probs=pi_expand).to_event(1))  # [N, K]
+        with pyro.plate("observations", N):
+            z = pyro.sample("z", dist.Bernoulli(probs=pi_expand).to_event(1))  # [N, K]
 
         W = pyro.sample(
             "W",
-            dist.Normal(torch.zeros(K, D, device=self.device, dtype=dtype),
-                        torch.ones(K, D, device=self.device, dtype=dtype)).to_event(2)
+            dist.Normal(torch.zeros(K, D, device=self.device, dtype=torch.float32),
+                        torch.ones(K, D, device=self.device, dtype=torch.float32)).to_event(2)
         )
 
         # Setting up NB draw
         # Multiple folders (when that becomes a problem)
         folder_logit = pyro.param(
             "folder_logit",
-            torch.zeros(G, D, device=self.device, dtype=dtype)
+            torch.zeros(G, D, device=self.device, dtype=torch.float32)
         )
         r = pyro.sample(
             "r",
-            dist.Gamma(torch.full((D,), 0.0, device=self.device, dtype=dtype), # 0 makes more sense, right?
-                    torch.full((D,), 1.0, device=self.device, dtype=dtype)).to_event(1)
+            dist.Gamma(torch.full((D,), 2.0, device=self.device, dtype=torch.float32), # 0 makes more sense, right?
+                    torch.full((D,), 1.0, device=self.device, dtype=torch.float32)).to_event(1)
         )
 
         # Compute latent feature contribution to expression.
@@ -111,7 +114,7 @@ class SpatialIndianBuffetProcess(PyroModule):
     def guide(self, coordinates, count_matrix, group_assignments):
         N, D = count_matrix.shape
         K = int(self.n_latent_factors.item())
-        size_factor = torch.log(X.sum(axis=1) / X.sum(axis=1).mean())
+        size_factor = torch.log(count_matrix.float().sum(axis=1) / count_matrix.float().sum(axis=1).mean())
 
         # Variational distribution for u_k (latent GPs): mean-field Gaussian
         u_loc = pyro.param(
@@ -165,22 +168,11 @@ class SpatialIndianBuffetProcess(PyroModule):
         )
         pyro.sample("r", dist.Gamma(r_alpha_q, r_beta_q).to_event(1))
 
-        # Distribution for tau: Gamma
-        tau_alpha_q = pyro.param(
-            "tau_alpha_q",
-            torch.full((), 2.0, device=self.device),
-            constraint=constraints.positive
-        )
-        tau_beta_q = pyro.param(
-            "tau_beta_q",
-            torch.full((), 1.0, device=self.device),
-            constraint=constraints.positive
-        )
-        pyro.sample("tau", dist.Gamma(tau_alpha_q, tau_beta_q))
-
-    def fit(coordinates, count_matrix, group_assignments, num_steps=300_000, lr=0.01, clear_param_store = True):
+    def fit(self, coordinates, count_matrix, group_assignments, num_steps=300_000, lr=0.01, clear_param_store = True, wandb_kwargs = {}):
         if clear_param_store == True:
             pyro.clear_param_store()
+
+        wandb.init(**wandb_kwargs, settings=wandb.Settings(_disable_stats=True), reinit=True)
 
         optimizer = ClippedAdam({"lr": lr, "clip_norm": 5.0})
 
@@ -191,20 +183,41 @@ class SpatialIndianBuffetProcess(PyroModule):
             loss=JitTrace_ELBO(num_particles=1),
         )
 
-        for step in range(num_steps):
-            loss = svi.step(
-                coordinates=coordinates,
-                count_matrix=count_matrix,
-                group_assignments=group_assignments,
-            )
-            wandb.log({
-                "loss": loss,
-                "mean_logit": pyro.get_param_store()["u_loc"].mean().item(),
-                "feature_sparsity": (pyro.get_param_store()["u_loc"] > 0).float().mean().item(),
-            })
+        try: 
+            for step in range(num_steps):
+                loss = svi.step(
+                    coordinates=coordinates,
+                    count_matrix=count_matrix,
+                    group_assignments=group_assignments,
+                )
+                wandb.log({
+                    "loss": loss,
+                    "mean_logit": pyro.get_param_store()["u_loc"].mean().item(),
+                    "feature_sparsity": (pyro.get_param_store()["u_loc"] > 0).float().mean().item(),
+                })
 
-            if step % 100 == 0 or step == num_steps - 1:
-                print(f"[{step:04d}] ELBO loss: {loss:.2f}")
+                if step % 100 == 0 or step == num_steps - 1:
+                    clear_output()
+                    print(f"[{step:04d}] ELBO loss: {loss:.2f}")
+        except KeyboardInterrupt:
+            print("Interrupted Training")
+        
+        finally:
+            wandb.finish()
+    
+    def return_latent_features(self):
+        params = dict(pyro.get_param_store())
+        latent_features = pd.DataFrame(
+            dict(pyro.get_param_store())["u_loc"].cpu().detach().numpy(),
+        ).T
+        return latent_features
+    
+    def return_latent_feature_weights(self):
+        weights = pd.DataFrame(
+            dict(pyro.get_param_store())["W_loc"].cpu().detach().numpy(),
+            columns = self.feature_names
+        ).T
+        return weights
 
 class IndianBuffetProcess(PyroModule):
     def __init__(self, n_latent_factors: int = 20, device: str = None):
@@ -256,7 +269,8 @@ class IndianBuffetProcess(PyroModule):
             z = pyro.sample("Z", dist.Bernoulli(pi).to_event(1))  # [N, K]
             logits = z @ W + size_factor.reshape(-1, 1)
             logits = logits + folder_logit[group_assignments.long()]
-            logits = torch.clamp(logits, -15, 15)
+            # FIXME: Is this necessary?
+            # logits = torch.clamp(logits, -15, 15)
             pyro.sample("X", dist.NegativeBinomial(total_count=r, logits=logits).to_event(1), obs=X)
 
     def guide(self, X, size_factor, group_assignments, alpha=1.0):
@@ -285,9 +299,12 @@ class IndianBuffetProcess(PyroModule):
         qr_beta = pyro.param("qr_beta", torch.ones(D, device=self.device), constraint=constraints.positive)
         pyro.sample("r", dist.Gamma(qr_alpha, qr_beta).to_event(1))
 
-    def fit(self, X, size_factor, group_assignments, num_steps=300_000, lr=0.01, clear_param_store=True):
+    def fit(self, X, size_factor, group_assignments, num_steps=300_000, lr=0.01, clear_param_store=True, wandb_kwargs = {}):
+
         if clear_param_store:
             pyro.clear_param_store()
+
+        wandb.init(**wandb_kwargs)
 
         optimizer = ClippedAdam({"lr": lr, "clip_norm": 5.0})
         svi = SVI(
